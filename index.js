@@ -1,6 +1,12 @@
-const { Client, GatewayIntentBits, PermissionsBitField, MessageCollector } = require('discord.js');
+const express = require('express');
+const path = require('path');
+const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder, MessageCollector } = require('discord.js');
 require('dotenv').config();
 
+const app = express();
+const PORT = 3000;
+
+// Discord Client Setup
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -11,33 +17,43 @@ const client = new Client({
   ],
 });
 
-// Rolle-ID for administratorer
 const ADMIN_ROLE_ID = '1320484049898307735'; // Erstat med den rolle, der skal administrere tickets
 
+const ticketData = new Map(); // For at holde styr på tickets
+
+// Start bot og opret ticket-panel
 client.once('ready', async () => {
   console.log(`${client.user.tag} er online og klar!`);
 
   const channel = client.channels.cache.get('1320476764920610967'); // Udskift med kanalens ID
   if (!channel) return console.error('Kan ikke finde kanalen. Sørg for, at ID er korrekt.');
 
-  // Kontrollér, om der allerede findes en ticket-besked
   const messages = await channel.messages.fetch({ limit: 50 });
-  const existingMessage = messages.find(
-    (msg) => msg.author.id === client.user.id && msg.content.includes('Reager med 📩 for at oprette en ticket!')
+  const existingEmbed = messages.find(
+    (msg) =>
+      msg.author.id === client.user.id &&
+      msg.embeds.length > 0 &&
+      msg.embeds[0].title === '🎟️ Opret en Ticket'
   );
 
-  if (!existingMessage) {
-    const message = await channel.send('📩 Reager med 📩 for at oprette en ticket!');
-    await message.react('📩'); // Reaktion for at oprette tickets
-    console.log('Ticket-besked sendt.');
+  if (!existingEmbed) {
+    const embed = new EmbedBuilder()
+      .setTitle('🎟️ Opret en Ticket')
+      .setDescription(
+        'Klik på 📩 nedenfor for at oprette en ticket.\n\n**Sådan fungerer det:**\n1. En ny kanal oprettes for din supportanmodning.\n2. Administratorer vil hjælpe dig hurtigst muligt.\n3. Du kan lukke ticketen, når problemet er løst.'
+      )
+      .setColor(0x5865f2)
+      .setFooter({ text: 'Administratoren kan til enhver tid lukke ticketen.' });
+
+    const message = await channel.send({ embeds: [embed] });
+    await message.react('📩');
+    console.log('Ticket-panel sendt.');
   } else {
-    console.log('Ticket-besked findes allerede.');
+    console.log('Ticket-panel findes allerede.');
   }
 });
 
-const ticketData = new Map(); // For at holde styr på claim og lukning
-
-// Opret ticket ved reaktion
+// Håndter reaktioner for at oprette tickets
 client.on('messageReactionAdd', async (reaction, user) => {
   if (reaction.partial) await reaction.fetch();
   if (user.bot) return;
@@ -76,8 +92,8 @@ client.on('messageReactionAdd', async (reaction, user) => {
       Administratorer kan \`claim\` eller \`lukke\` ticketen ved at bruge reaktionerne nedenfor.`
     );
 
-    await ticketMessage.react('✅'); // Claim
-    await ticketMessage.react('❌'); // Luk
+    await ticketMessage.react('✅');
+    await ticketMessage.react('❌');
     await member.send(`Din ticket er oprettet: ${ticketChannel}`);
   }
 });
@@ -90,17 +106,28 @@ client.on('messageReactionAdd', async (reaction, user) => {
   const { message, emoji } = reaction;
   const member = message.guild.members.cache.get(user.id);
 
+  // Tjek om brugeren har administratorrollen
   if (!member.roles.cache.has(ADMIN_ROLE_ID)) return;
 
   if (emoji.name === '✅' && message.channel.name.startsWith('ticket-')) {
-    reaction.users.remove(user.id);
+    reaction.users.remove(user.id); // Fjern reaktionen fra brugeren
 
-    ticketData.get(message.channel.id).claimedBy = member;
+    const ticket = ticketData.get(message.channel.id);
+
+    if (ticket.claimedBy) {
+      return message.channel.send('Denne ticket er allerede blevet claimet.');
+    }
+
+    ticket.claimedBy = member;
+
+    // Opdater dashboard API med nye værdier
+    app.locals.ticketData = [...ticketData.values()];
 
     const claimMessage = await message.channel.send(
       `${member} har claimet denne ticket.`
     );
-    setTimeout(() => claimMessage.delete(), 5000);
+
+    setTimeout(() => claimMessage.delete().catch(() => {}), 5000); // Fjern claim-beskeden efter 5 sekunder
   }
 
   if (emoji.name === '❌' && message.channel.name.startsWith('ticket-')) {
@@ -138,6 +165,10 @@ client.on('messageReactionAdd', async (reaction, user) => {
         reasonCollector.stop();
 
         ticketData.get(message.channel.id).closedBy = member;
+        ticketData.get(message.channel.id).closedAt = new Date(); // Sørg for, at lukketidspunktet gemmes
+
+        // Opdater dashboard API med nye værdier
+        app.locals.ticketData = [...ticketData.values()];
 
         const logCategory =
           message.guild.channels.cache.find(
@@ -180,12 +211,35 @@ client.on('messageReactionAdd', async (reaction, user) => {
           );
         }
 
-        await message.channel.delete();
         ticketData.delete(message.channel.id);
+        await message.channel.delete().catch(() => {});
       });
     });
   }
 });
 
-// Login med bot-token
+// Dashboard API
+app.use(express.static(path.join(__dirname, 'dashboard')));
+
+app.get('/tickets', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dashboard', 'index.html'));
+});
+
+app.get('/api/tickets', (req, res) => {
+  const openTickets = [...ticketData.values()].filter(ticket => !ticket.closedBy);
+  const closedTickets = [...ticketData.values()].filter(ticket => ticket.closedBy);
+
+  res.json({
+    open: openTickets.length,
+    closed: closedTickets.length,
+    pending: openTickets.length, // Alle åbne anses som ventende her
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Dashboard tilgængeligt på http://localhost:${PORT}`);
+});
+
+// Login bot
 client.login(process.env.DISCORD_TOKEN);
